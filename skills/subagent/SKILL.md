@@ -1,6 +1,6 @@
 ---
 name: subagent
-description: Spawn and communicate with observable Pi subagents for second opinions, independent investigations, and delegated implementation work.
+description: Spawn and communicate with observable Pi subagents. Use only when the user asks for a subagent.
 ---
 
 # Subagent
