@@ -2,13 +2,13 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own terminal (a herdr pane or a tmux session) with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- [herdr](https://herdr.dev) or tmux
 
 ## Install
 
@@ -69,6 +69,29 @@ subagent list
 ```
 
 Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+
+## Terminal backends
+
+When the parent Pi runs inside herdr (`HERDR_ENV=1`), subagents open as herdr panes; otherwise they use detached tmux sessions. Set `PI_SUBAGENT_BACKEND=tmux` or `PI_SUBAGENT_BACKEND=herdr` to force one.
+
+With herdr:
+
+- Children of one parent session share a `subagents` tab in the parent's workspace, split side by side, so they can be watched without attaching. The tab closes when its last child stops.
+- Herdr's Pi integration reports each child's `working`, `idle`, `done`, or `blocked` state in the sidebar.
+- Each child shows as `↳ <name>` in the sidebar and gets a herdr agent name of `<name-slug>-<handle>`, usable with `herdr agent read` and similar commands. Keep using `subagent send` for prompts.
+- `/subagent` focuses the child's pane.
+- `--worktree <branch>` runs the child in a herdr-managed git worktree, opened as its own workspace grouped under the repository's workspace. An existing checkout of that branch is reused. `subagent stop` closes the workspace but keeps the checkout; remove it with `herdr worktree remove`.
+- Moved panes are followed by their Pi session file. If herdr restarts and resumes a child, the resumed process takes over the run, and a duplicate launched by the parent exits.
+
+To render children nested under their parent in the agents sidebar, add this to `~/.config/herdr/config.toml`:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "machine", "workspace", { token = "tab", rules = [{ equals = "subagents", hide = true }] }],
+  [{ token = "agent", rules = [{ starts_with = "↳", dim = true }] }],
+]
+```
 
 ## Isolation
 

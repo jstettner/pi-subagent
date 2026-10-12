@@ -12,8 +12,31 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+	findPaneBySession,
+	getPane,
+	HERDR_TAB_LABEL,
+	herdr,
+	insideHerdr,
+	shellQuote,
+	splitDirection,
+	tryHerdr,
+} from "./herdr.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
+
+export type RunBackend = "tmux" | "herdr";
+
+export interface HerdrPlacement {
+	/** Pane currently hosting the child; updated when the pane is moved or restored. */
+	paneId?: string;
+	tabId?: string;
+	workspaceId?: string;
+	/** Workspace of the spawning parent, where the shared subagents tab lives. */
+	parentWorkspaceId?: string;
+	/** Linked git worktree the child runs in, opened as its own herdr workspace. */
+	worktree?: { branch: string; path?: string; repoCwd: string };
+}
 
 export interface RunMetadata {
 	version: 1;
@@ -22,7 +45,10 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
-	tmuxSession: string;
+	/** Absent on runs created before herdr support, which always used tmux. */
+	backend?: RunBackend;
+	tmuxSession?: string;
+	herdr?: HerdrPlacement;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -103,7 +129,7 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 			metadata.version !== 1 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
+			(metadata.backend === "herdr" ? typeof metadata.herdr !== "object" : typeof metadata.tmuxSession !== "string") ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -151,12 +177,59 @@ export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+export function runBackend(metadata: RunMetadata): RunBackend {
+	return metadata.backend ?? "tmux";
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+/** Prefer herdr panes when running inside herdr; `PI_SUBAGENT_BACKEND` forces a backend. */
+export function selectBackend(): RunBackend {
+	const forced = process.env.PI_SUBAGENT_BACKEND;
+	if (forced === "tmux" || forced === "herdr") return forced;
+	return insideHerdr() ? "herdr" : "tmux";
+}
+
+function tmuxSessionExists(session: string | undefined): boolean {
+	return !!session && spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+}
+
+/** Resolve the herdr pane hosting a run, following moves and herdr restores via the pi session file. */
+export function resolveHerdrPane(metadata: RunMetadata): string | undefined {
+	const paneId = metadata.herdr?.paneId;
+	// Herdr keeps a moved pane's old ID as an alias, so a lookup can return a different canonical ID.
+	const pane = (paneId ? getPane(paneId) : undefined) ?? findPaneBySession(metadata.sessionFile);
+	if (!pane) return undefined;
+	if (pane.pane_id === paneId) return paneId;
+	updateMetadata(metadata.runDir, {
+		herdr: { ...metadata.herdr, paneId: pane.pane_id, tabId: pane.tab_id, workspaceId: pane.workspace_id },
+	});
+	return pane.pane_id;
+}
+
+export function runIsAlive(metadata: RunMetadata): boolean {
+	return runBackend(metadata) === "herdr"
+		? resolveHerdrPane(metadata) !== undefined
+		: tmuxSessionExists(metadata.tmuxSession);
+}
+
+/** Terminate the child process. Herdr closes the pane, and the tab or worktree workspace once it is empty. */
+export function killRun(metadata: RunMetadata): void {
+	if (runBackend(metadata) === "herdr") {
+		const paneId = resolveHerdrPane(metadata);
+		if (paneId) tryHerdr(["pane", "close", paneId]);
+		return;
+	}
+	if (metadata.tmuxSession) spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
+}
+
+export function attachHint(metadata: RunMetadata): string {
+	if (runBackend(metadata) === "herdr") {
+		const paneId = readMetadata(metadata.runDir)?.herdr?.paneId ?? metadata.herdr?.paneId;
+		return paneId ? `herdr agent focus ${paneId}` : "(herdr pane not started)";
+	}
+	return `tmux attach -t ${metadata.tmuxSession}`;
+}
+
+function piCommand(metadata: RunMetadata, initialArgs: string[]): string[] {
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -165,7 +238,30 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 	} catch {
 		// Use the installed pi executable.
 	}
+	return [
+		"env",
+		`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+		launcher,
+		"--session",
+		metadata.sessionFile,
+		"--provider",
+		metadata.provider,
+		"--model",
+		metadata.model,
+		"--thinking",
+		metadata.thinking,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	];
+}
 
+/** Start the child pi process for a run. `initialArgs` are only passed on first spawn. */
+export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+	if (runBackend(metadata) === "herdr") {
+		launchHerdrRun(metadata, initialArgs);
+		return;
+	}
+	if (!metadata.tmuxSession) throw new Error(`${metadata.handle} has no tmux session`);
 	const result = spawnSync(
 		"tmux",
 		[
@@ -180,29 +276,122 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			"-c",
 			metadata.cwd,
 			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
+			...piCommand(metadata, initialArgs),
 		],
 		{ encoding: "utf8" },
 	);
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
 
+interface PaneResult {
+	pane_id: string;
+	tab_id: string;
+	workspace_id: string;
+}
+
+/** Open the run's worktree workspace, creating the checkout on first launch. Returns a fresh shell pane in it. */
+function placeInWorktree(metadata: RunMetadata, worktree: NonNullable<HerdrPlacement["worktree"]>): PaneResult {
+	if (!worktree.path) {
+		// Reuse an existing checkout of the branch, e.g. one kept by an earlier stopped run.
+		const existing = (
+			herdr(["worktree", "list", "--cwd", worktree.repoCwd]).worktrees as { branch?: string; path: string }[]
+		).find((candidate) => candidate.branch === worktree.branch || candidate.branch === `refs/heads/${worktree.branch}`);
+		if (existing && existsSync(existing.path)) {
+			worktree = { ...worktree, path: existing.path };
+			updateMetadata(metadata.runDir, { cwd: existing.path, herdr: { ...metadata.herdr, worktree } });
+			metadata.cwd = existing.path;
+		}
+	}
+	if (worktree.path && existsSync(worktree.path)) {
+		const opened = herdr([
+			"worktree",
+			"open",
+			"--cwd",
+			worktree.repoCwd,
+			"--path",
+			worktree.path,
+			"--no-focus",
+		]);
+		const workspaceId = (opened.workspace as { workspace_id: string }).workspace_id;
+		if (!opened.already_open) {
+			const pane = (herdr(["pane", "list", "--workspace", workspaceId]).panes as PaneResult[])[0];
+			if (pane) return pane;
+		}
+		const created = herdr(["tab", "create", "--workspace", workspaceId, "--cwd", worktree.path, "--no-focus"]);
+		return created.root_pane as PaneResult;
+	}
+	const args = ["worktree", "create", "--cwd", worktree.repoCwd, "--branch", worktree.branch, "--no-focus"];
+	if (metadata.name) args.push("--label", metadata.name);
+	const created = herdr(args);
+	const path = (created.worktree as { path: string }).path;
+	updateMetadata(metadata.runDir, { cwd: path, herdr: { ...metadata.herdr, worktree: { ...worktree, path } } });
+	metadata.cwd = path;
+	return created.root_pane as PaneResult;
+}
+
+/** Split a live sibling's pane in the parent's subagents tab, or open that tab next to the parent. */
+function placeInSubagentsTab(metadata: RunMetadata): PaneResult {
+	const sibling = listRuns(metadata.parentSessionId)
+		.filter(
+			(run) =>
+				run.handle !== metadata.handle &&
+				run.parentSessionId !== undefined &&
+				runBackend(run) === "herdr" &&
+				!run.herdr?.worktree &&
+				run.herdr?.tabId !== undefined,
+		)
+		.reverse()
+		.find((run) => run.herdr?.paneId && getPane(run.herdr.paneId)?.tab_id === run.herdr.tabId);
+	const siblingPane = sibling?.herdr?.paneId;
+	if (siblingPane) {
+		const split = herdr([
+			"pane",
+			"split",
+			siblingPane,
+			"--direction",
+			splitDirection(siblingPane),
+			"--cwd",
+			metadata.cwd,
+			"--no-focus",
+		]);
+		return split.pane as PaneResult;
+	}
+	const args = ["tab", "create", "--label", HERDR_TAB_LABEL, "--cwd", metadata.cwd, "--no-focus"];
+	const workspaceId = metadata.herdr?.parentWorkspaceId;
+	if (workspaceId) args.push("--workspace", workspaceId);
+	return herdr(args).root_pane as PaneResult;
+}
+
+function launchHerdrRun(metadata: RunMetadata, initialArgs: string[]): void {
+	const worktree = metadata.herdr?.worktree;
+	const pane = worktree ? placeInWorktree(metadata, worktree) : placeInSubagentsTab(metadata);
+	updateMetadata(metadata.runDir, {
+		herdr: {
+			...readMetadata(metadata.runDir)?.herdr,
+			paneId: pane.pane_id,
+			tabId: pane.tab_id,
+			workspaceId: pane.workspace_id,
+		},
+	});
+	tryHerdr(["pane", "rename", pane.pane_id, metadata.name ?? metadata.handle]);
+
+	// The pane runs a shell; a script avoids quoting the prompt through it, and `exec` makes the pane close
+	// when pi exits so pane liveness tracks the child process.
+	const script = join(metadata.runDir, "launch.sh");
+	const command = piCommand(metadata, initialArgs).map(shellQuote).join(" ");
+	writeFileSync(script, `cd ${shellQuote(metadata.cwd)} || exit 1\nexec ${command}\n`, { mode: 0o700 });
+	try {
+		herdr(["pane", "run", pane.pane_id, `exec sh ${shellQuote(script)}`]);
+	} catch (error) {
+		tryHerdr(["pane", "close", pane.pane_id]);
+		throw error;
+	}
+}
+
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!runIsAlive(metadata)
 	) {
 		return "exited";
 	}

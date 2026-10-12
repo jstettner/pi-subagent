@@ -1,12 +1,15 @@
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
+import { getPane, HERDR_METADATA_SOURCE, herdrAgentName, herdrBin, tryHerdr } from "./herdr.ts";
 import {
 	effectiveRunState,
+	getRunsDir,
 	inboxDir,
+	killRun,
 	launchRun,
 	listRuns,
 	readMetadata,
@@ -14,7 +17,9 @@ import {
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
+	resolveHerdrPane,
+	runBackend,
+	runIsAlive,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
@@ -27,12 +32,27 @@ function isInboxMessage(value: unknown): value is InboxMessage {
 	return typeof message.message === "string" && (message.delivery === "auto" || message.delivery === "followUp");
 }
 
+/**
+ * Herdr resumes pi panes after a server restart with only `pi --session <file>`, dropping the run directory
+ * environment. Recognize a run's session file so the resumed process still acts as that subagent.
+ */
+function runDirFromSessionArg(): string | undefined {
+	const index = process.argv.indexOf("--session");
+	const sessionFile = index >= 0 ? process.argv[index + 1] : undefined;
+	if (!sessionFile || basename(sessionFile) !== "session.jsonl") return undefined;
+	const candidate = dirname(sessionFile);
+	if (dirname(candidate) !== getRunsDir()) return undefined;
+	return readMetadata(candidate)?.sessionFile === sessionFile ? candidate : undefined;
+}
+
 function displayState(metadata: RunMetadata): string {
 	return effectiveRunState(metadata).padEnd(8);
 }
 
 export default function subagentExtension(pi: ExtensionAPI) {
-	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
+	const runDir = process.env.PI_SUBAGENT_RUN_DIR || runDirFromSessionArg();
+	// Keep nested spawns disabled for tools run by a child that herdr resumed without the environment.
+	if (runDir) process.env.PI_SUBAGENT_RUN_DIR = runDir;
 	if (!runDir) {
 		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
 	}
@@ -92,9 +112,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
 
+			if (runBackend(run) === "herdr") {
+				const paneId = resolveHerdrPane(run);
+				const tabId = paneId ? getPane(paneId)?.tab_id : undefined;
+				const focused =
+					paneId !== undefined &&
+					(tryHerdr(["agent", "focus", paneId]) !== undefined ||
+						(tabId !== undefined && tryHerdr(["tab", "focus", tabId]) !== undefined));
+				if (!focused) ctx.ui.notify(`Could not focus ${run.handle}`, "error");
+				return;
+			}
+			const tmuxSession = run.tmuxSession;
+			if (!tmuxSession) return;
+
 			if (process.env.TMUX) {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["switch-client", "-t", run.tmuxSession], { stdio: "inherit" });
+					const child = spawn("tmux", ["switch-client", "-t", tmuxSession], { stdio: "inherit" });
 					child.on("error", () => resolveExit(null));
 					child.on("close", resolveExit);
 				});
@@ -105,7 +138,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			tui.stop();
 			try {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
-					const child = spawn("tmux", ["attach-session", "-t", run.tmuxSession], { stdio: "inherit" });
+					const child = spawn("tmux", ["attach-session", "-t", tmuxSession], { stdio: "inherit" });
 					child.on("error", () => resolveExit(null));
 					child.on("close", resolveExit);
 				});
@@ -149,7 +182,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
+				if (!run.suspended || runIsAlive(run)) continue;
 				if (!existsSync(run.sessionFile)) {
 					removeRunDir(run.runDir);
 					continue;
@@ -180,12 +213,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
+				if (!runIsAlive(run)) {
 					if (!run.suspended) removeRunDir(run.runDir);
 					continue;
 				}
 				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
+				killRun(run);
 				await waitForRunShutdown(run.runDir);
 			}
 		});
@@ -196,14 +229,80 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let processing = false;
 	let sessionName: string | undefined;
+	const herdrPaneId = process.env.HERDR_ENV === "1" ? process.env.HERDR_PANE_ID : undefined;
+	let herdrLabel: string | undefined;
+	let herdrAgentLabel: string | undefined;
+	let herdrPending = false;
+	let yielded = false;
+
+	const runHerdr = (args: string[]): Promise<boolean> =>
+		new Promise((resolveRun) => execFile(herdrBin(), args, (error) => resolveRun(!error)));
+
+	/** Show the subagent nested under its parent in the herdr sidebar; see README for the matching row layout. */
+	const syncHerdrLabels = async (metadata: RunMetadata): Promise<void> => {
+		if (!herdrPaneId || herdrPending) return;
+		const label = metadata.name ?? metadata.handle;
+		const agentName = herdrAgentName(metadata.handle, metadata.name);
+		if (label === herdrLabel && agentName === herdrAgentLabel) return;
+		herdrPending = true;
+		try {
+			if (label !== herdrLabel) {
+				const reported = await runHerdr([
+					"pane",
+					"report-metadata",
+					herdrPaneId,
+					"--source",
+					HERDR_METADATA_SOURCE,
+					"--display-agent",
+					`↳ ${label}`,
+					"--token",
+					`subagent=${label}`,
+				]);
+				if (reported) {
+					herdrLabel = label;
+					void runHerdr(["pane", "rename", herdrPaneId, label]);
+				}
+			}
+			// Naming requires herdr to have detected pi in the pane, so this retries until it succeeds.
+			if (agentName !== herdrAgentLabel && (await runHerdr(["agent", "rename", herdrPaneId, agentName]))) {
+				herdrAgentLabel = agentName;
+			}
+		} finally {
+			herdrPending = false;
+		}
+	};
 
 	const syncSessionName = (): void => {
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
+		void syncHerdrLabels(metadata);
 		const next = `subagent ${metadata.name ?? metadata.handle}`;
 		if (next === sessionName) return;
 		pi.setSessionName(next);
 		sessionName = next;
+	};
+
+	/**
+	 * Claim the run for this herdr pane. A herdr restore and the parent's relaunch can both start the child;
+	 * the later process yields so only one pi writes the session. Returns false when this process must exit.
+	 */
+	const claimHerdrPane = (metadata: RunMetadata): boolean => {
+		if (!herdrPaneId || runBackend(metadata) !== "herdr") return true;
+		const owner = metadata.herdr?.paneId;
+		if (owner && owner !== herdrPaneId) {
+			const pane = getPane(owner);
+			if (pane?.agent === "pi" && pane.agent_session?.value === metadata.sessionFile) return false;
+		}
+		const pane = getPane(herdrPaneId);
+		updateMetadata(runDir, {
+			herdr: {
+				...metadata.herdr,
+				paneId: herdrPaneId,
+				tabId: pane?.tab_id ?? metadata.herdr?.tabId,
+				workspaceId: pane?.workspace_id ?? metadata.herdr?.workspaceId,
+			},
+		});
+		return true;
 	};
 
 	const processInbox = async (): Promise<void> => {
@@ -258,6 +357,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		currentContext = ctx;
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
+		if (!claimHerdrPane(metadata)) {
+			yielded = true;
+			currentContext = undefined;
+			ctx.shutdown();
+			return;
+		}
 		updateMetadata(runDir, {
 			childSessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
@@ -289,6 +394,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			clearInterval(timer);
 			timer = undefined;
 		}
-		if (event.reason === "quit") updateMetadata(runDir, { state: "exited" });
+		if (event.reason === "quit" && !yielded) updateMetadata(runDir, { state: "exited" });
 	});
 }

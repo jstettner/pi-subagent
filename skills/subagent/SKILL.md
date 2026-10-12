@@ -5,7 +5,7 @@ description: Spawn and communicate with observable Pi subagents for second opini
 
 # Subagent
 
-Use the `subagent` CLI to delegate work to a separate Pi process with its own context and tmux session. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
+Use the `subagent` CLI to delegate work to a separate Pi process with its own context and terminal (a herdr pane when running inside herdr, otherwise a tmux session). Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
 
 ## Spawn
 
@@ -17,7 +17,7 @@ subagent spawn --name implementation --prompt "Complete task"
 
 By default, the child inherits the current Pi provider, model, and reasoning level from the bash environment. Use `--provider`, `--model`, or `--thinking` only when deliberately choosing a different configuration, for example a faster model for simple investigation or a stronger model for difficult review. Never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
 
-`--cwd` defaults to the current directory. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
+`--cwd` defaults to the current directory. Inside herdr, `--worktree <branch>` runs implementation work in a separate git worktree on that branch (created if needed); use it only when the user wants the changes isolated from the current checkout, and report the printed worktree path. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
 
 ## Tools
 
@@ -53,7 +53,7 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+Spawn prints a random handle and the exact attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
 
 ## Inspect and wait
 
@@ -80,7 +80,7 @@ subagent send <handle> "message"
 subagent send <handle> --follow-up "message"
 ```
 
-Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
+Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`, `herdr agent prompt`, or `herdr pane send-text`.
 
 ## Stop
 
@@ -88,6 +88,6 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates its tmux session or herdr pane and removes the run transcript and metadata. A `--worktree` checkout is kept. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
+The interactive `/subagent` command lists active subagents spawned by the current Pi session. Inside herdr, selecting one focuses its pane. With tmux, selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.

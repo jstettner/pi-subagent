@@ -2,14 +2,16 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { insideHerdr } from "./herdr.ts";
 import {
 	assistantText,
+	attachHint,
 	effectiveRunState,
 	getRunsDir,
 	inboxDir,
+	killRun,
 	launchRun,
 	listRuns,
 	readLatestAssistant,
@@ -19,7 +21,8 @@ import {
 	isValidRunName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
+	runIsAlive,
+	selectBackend,
 	updateMetadata,
 	waitForRunShutdown,
 	writeMetadata,
@@ -36,7 +39,7 @@ function usage(): never {
 	fail(`Usage:
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
     [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
-    [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
+    [--no-prompt-templates] [--no-context-files] [--worktree <branch>] (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
@@ -89,6 +92,7 @@ function spawnSubagent(args: string[]): void {
 	let noSkills = false;
 	let noPromptTemplates = false;
 	let noContextFiles = false;
+	let worktreeBranch: string | undefined;
 	const prompts: string[] = [];
 	const files: string[] = [];
 
@@ -131,6 +135,10 @@ function spawnSubagent(args: string[]): void {
 			case "--no-context-files":
 				noContextFiles = true;
 				break;
+			case "--worktree":
+				worktreeBranch = valueAfter(args, i, arg);
+				i++;
+				break;
 			case "--prompt":
 				prompts.push(valueAfter(args, i, arg));
 				i++;
@@ -154,11 +162,13 @@ function spawnSubagent(args: string[]): void {
 		fail("--tools requires at least one tool name");
 	if (prompts.length === 0 && files.length === 0) fail("spawn requires at least one --prompt or --file");
 	if (!existsSync(cwd)) fail(`Working directory not found: ${cwd}`);
+	const backend = selectBackend();
+	if (backend === "herdr" && !insideHerdr()) fail("The herdr backend requires running inside a herdr pane");
+	if (worktreeBranch !== undefined && backend !== "herdr") fail("--worktree requires the herdr backend");
 
 	const handle = generateHandle();
 	const runDir = runDirForHandle(handle);
 	const sessionFile = join(runDir, "session.jsonl");
-	const tmuxSession = `pi-subagent-${handle}`;
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
@@ -176,7 +186,15 @@ function spawnSubagent(args: string[]): void {
 		name,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
-		tmuxSession,
+		backend,
+		tmuxSession: backend === "tmux" ? `pi-subagent-${handle}` : undefined,
+		herdr:
+			backend === "herdr"
+				? {
+						parentWorkspaceId: process.env.HERDR_WORKSPACE_ID || undefined,
+						worktree: worktreeBranch ? { branch: worktreeBranch, repoCwd: cwd } : undefined,
+					}
+				: undefined,
 		runDir,
 		sessionFile,
 		cwd,
@@ -200,14 +218,18 @@ function spawnSubagent(args: string[]): void {
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	const launched = readMetadata(runDir) ?? metadata;
+	const worktree = launched.herdr?.worktree?.path ? `\nWorktree: ${launched.herdr.worktree.path}` : "";
+	process.stdout.write(
+		`Spawned ${runDisplayName(launched)}\nState: busy\nAttach: ${attachHint(launched)}${worktree}\n`,
+	);
 }
 
 function statusSubagent(args: string[]): void {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: tmux attach -t ${metadata.tmuxSession}\n`,
+		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: ${attachHint(metadata)}\n`,
 	);
 }
 
@@ -233,7 +255,7 @@ function sendSubagent(args: string[]): void {
 	const message = messageParts.join(" ").trim();
 	if (!message) fail("send requires a message");
 	const metadata = getRun(handle);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
+	if (!runIsAlive(metadata)) fail(`${handle} is not running`);
 
 	const queueDir = inboxDir(metadata.runDir);
 	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
@@ -286,11 +308,14 @@ async function waitSubagent(args: string[]): Promise<void> {
 async function stopSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
-	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
+	const wasRunning = runIsAlive(metadata);
+	killRun(metadata);
 	if (wasRunning) await waitForRunShutdown(metadata.runDir);
 	removeRunDir(metadata.runDir);
-	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	const worktree = metadata.herdr?.worktree?.path;
+	process.stdout.write(
+		`Stopped ${runDisplayName(metadata)}\n${worktree ? `Worktree checkout kept at ${worktree}\n` : ""}`,
+	);
 }
 
 function listSubagents(args: string[]): void {
