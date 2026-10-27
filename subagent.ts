@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "n
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insideHerdr } from "./herdr.ts";
+import { insideRex } from "./rex.ts";
 import {
 	assistantText,
 	attachHint,
@@ -164,6 +165,7 @@ function spawnSubagent(args: string[]): void {
 	if (!existsSync(cwd)) fail(`Working directory not found: ${cwd}`);
 	const backend = selectBackend();
 	if (backend === "herdr" && !insideHerdr()) fail("The herdr backend requires running inside a herdr pane");
+	if (backend === "rex" && !insideRex()) fail("The rex backend requires running inside a rex terminal");
 	if (worktreeBranch !== undefined && backend !== "herdr") fail("--worktree requires the herdr backend");
 
 	const handle = generateHandle();
@@ -195,6 +197,7 @@ function spawnSubagent(args: string[]): void {
 						worktree: worktreeBranch ? { branch: worktreeBranch, repoCwd: cwd } : undefined,
 					}
 				: undefined,
+		rex: backend === "rex" ? { sessionId: process.env.REX_SESSION! } : undefined,
 		runDir,
 		sessionFile,
 		cwd,

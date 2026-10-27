@@ -22,10 +22,11 @@ import {
 	splitDirection,
 	tryHerdr,
 } from "./herdr.ts";
+import { blockIsRunning, insideRex, REX_WINDOW_LABEL, rex, splitDirection as rexSplitDirection, tryRex } from "./rex.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
-export type RunBackend = "tmux" | "herdr";
+export type RunBackend = "tmux" | "herdr" | "rex";
 
 export interface HerdrPlacement {
 	/** Pane currently hosting the child; updated when the pane is moved or restored. */
@@ -36,6 +37,13 @@ export interface HerdrPlacement {
 	parentWorkspaceId?: string;
 	/** Linked git worktree the child runs in, opened as its own herdr workspace. */
 	worktree?: { branch: string; path?: string; repoCwd: string };
+}
+
+export interface RexPlacement {
+	/** Rex session of the spawning parent; the child's block lives there. */
+	sessionId: string;
+	blockId?: string;
+	windowId?: string;
 }
 
 export interface RunMetadata {
@@ -49,6 +57,7 @@ export interface RunMetadata {
 	backend?: RunBackend;
 	tmuxSession?: string;
 	herdr?: HerdrPlacement;
+	rex?: RexPlacement;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -129,7 +138,11 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 			metadata.version !== 1 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			(metadata.backend === "herdr" ? typeof metadata.herdr !== "object" : typeof metadata.tmuxSession !== "string") ||
+			(metadata.backend === "herdr"
+				? typeof metadata.herdr !== "object"
+				: metadata.backend === "rex"
+					? typeof metadata.rex?.sessionId !== "string"
+					: typeof metadata.tmuxSession !== "string") ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -181,11 +194,12 @@ export function runBackend(metadata: RunMetadata): RunBackend {
 	return metadata.backend ?? "tmux";
 }
 
-/** Prefer herdr panes when running inside herdr; `PI_SUBAGENT_BACKEND` forces a backend. */
+/** Prefer herdr panes inside herdr, then rex blocks inside rex; `PI_SUBAGENT_BACKEND` forces a backend. */
 export function selectBackend(): RunBackend {
 	const forced = process.env.PI_SUBAGENT_BACKEND;
-	if (forced === "tmux" || forced === "herdr") return forced;
-	return insideHerdr() ? "herdr" : "tmux";
+	if (forced === "tmux" || forced === "herdr" || forced === "rex") return forced;
+	if (insideHerdr()) return "herdr";
+	return insideRex() ? "rex" : "tmux";
 }
 
 function tmuxSessionExists(session: string | undefined): boolean {
@@ -206,16 +220,29 @@ export function resolveHerdrPane(metadata: RunMetadata): string | undefined {
 }
 
 export function runIsAlive(metadata: RunMetadata): boolean {
-	return runBackend(metadata) === "herdr"
-		? resolveHerdrPane(metadata) !== undefined
-		: tmuxSessionExists(metadata.tmuxSession);
+	switch (runBackend(metadata)) {
+		case "herdr":
+			return resolveHerdrPane(metadata) !== undefined;
+		case "rex":
+			return !!metadata.rex?.blockId && blockIsRunning(metadata.rex.sessionId, metadata.rex.blockId);
+		case "tmux":
+			return tmuxSessionExists(metadata.tmuxSession);
+	}
 }
 
-/** Terminate the child process. Herdr closes the pane, and the tab or worktree workspace once it is empty. */
+/**
+ * Terminate the child process. Herdr closes the pane, and the tab or worktree workspace once it is empty;
+ * rex closes the block, and its window once it is empty.
+ */
 export function killRun(metadata: RunMetadata): void {
 	if (runBackend(metadata) === "herdr") {
 		const paneId = resolveHerdrPane(metadata);
 		if (paneId) tryHerdr(["pane", "close", paneId]);
+		return;
+	}
+	if (runBackend(metadata) === "rex") {
+		const placement = metadata.rex;
+		if (placement?.blockId) tryRex(["block", "close", "-s", placement.sessionId, placement.blockId]);
 		return;
 	}
 	if (metadata.tmuxSession) spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
@@ -225,6 +252,12 @@ export function attachHint(metadata: RunMetadata): string {
 	if (runBackend(metadata) === "herdr") {
 		const paneId = readMetadata(metadata.runDir)?.herdr?.paneId ?? metadata.herdr?.paneId;
 		return paneId ? `herdr agent focus ${paneId}` : "(herdr pane not started)";
+	}
+	if (runBackend(metadata) === "rex") {
+		const placement = readMetadata(metadata.runDir)?.rex ?? metadata.rex;
+		return placement?.blockId
+			? `rex focus -s ${placement.sessionId} ${placement.blockId}`
+			: "(rex block not started)";
 	}
 	return `tmux attach -t ${metadata.tmuxSession}`;
 }
@@ -259,6 +292,10 @@ function piCommand(metadata: RunMetadata, initialArgs: string[]): string[] {
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
 	if (runBackend(metadata) === "herdr") {
 		launchHerdrRun(metadata, initialArgs);
+		return;
+	}
+	if (runBackend(metadata) === "rex") {
+		launchRexRun(metadata, initialArgs);
 		return;
 	}
 	if (!metadata.tmuxSession) throw new Error(`${metadata.handle} has no tmux session`);
@@ -386,6 +423,83 @@ function launchHerdrRun(metadata: RunMetadata, initialArgs: string[]): void {
 		tryHerdr(["pane", "close", pane.pane_id]);
 		throw error;
 	}
+}
+
+/** The window holding a rex block, or undefined when the block no longer exists. */
+function rexBlockWindow(sessionId: string, blockId: string): string | undefined {
+	const block = tryRex(["block", "inspect", "-s", sessionId, blockId, "--json"])?.block as
+		| { window_id?: string }
+		| undefined;
+	return block?.window_id;
+}
+
+/**
+ * Split a live sibling's block in the parent's subagents window, or open that window in the parent's rex session.
+ * Rex passes the command's arguments through unchanged and closes the block when pi exits, so block liveness
+ * tracks the child process.
+ */
+function launchRexRun(metadata: RunMetadata, initialArgs: string[]): void {
+	const placement = metadata.rex;
+	if (!placement) throw new Error(`${metadata.handle} has no rex placement`);
+	const sessionId = placement.sessionId;
+	const command = piCommand(metadata, initialArgs);
+	const label = metadata.name ?? metadata.handle;
+
+	const sibling = listRuns(metadata.parentSessionId)
+		.filter(
+			(run) =>
+				run.handle !== metadata.handle &&
+				run.parentSessionId !== undefined &&
+				runBackend(run) === "rex" &&
+				run.rex?.sessionId === sessionId &&
+				run.rex.blockId !== undefined &&
+				run.rex.windowId !== undefined,
+		)
+		.reverse()
+		.find((run) => rexBlockWindow(sessionId, run.rex!.blockId!) === run.rex!.windowId);
+
+	let blockId: string;
+	let windowId: string;
+	if (sibling?.rex?.blockId && sibling.rex.windowId) {
+		const anchor = sibling.rex.blockId;
+		const split = rex([
+			"split",
+			"-s",
+			sessionId,
+			"-b",
+			anchor,
+			"--split",
+			rexSplitDirection(sessionId, anchor),
+			"-c",
+			metadata.cwd,
+			"--label",
+			label,
+			"--focus=false",
+			"--json",
+			"--",
+			...command,
+		]);
+		blockId = (split.block_ids as string[])[0];
+		windowId = sibling.rex.windowId;
+	} else {
+		const created = rex([
+			"window",
+			"new",
+			"-s",
+			sessionId,
+			REX_WINDOW_LABEL,
+			"-c",
+			metadata.cwd,
+			"--focus=false",
+			"--json",
+			"--",
+			...command,
+		]);
+		blockId = (created.block_ids as string[])[0];
+		windowId = created.window_id as string;
+		tryRex(["block", "rename", "-s", sessionId, blockId, label]);
+	}
+	updateMetadata(metadata.runDir, { rex: { ...readMetadata(metadata.runDir)?.rex, sessionId, blockId, windowId } });
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {

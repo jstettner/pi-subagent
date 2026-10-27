@@ -2,13 +2,13 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own terminal (a herdr pane or a tmux session) with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own terminal (a herdr pane, a Rex block, or a tmux session) with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- [herdr](https://herdr.dev) or tmux
+- [herdr](https://herdr.dev), [Rex](https://www.superlogical.com/rex), or tmux
 
 ## Install
 
@@ -72,7 +72,7 @@ Use `/subagent` to select and attach to an active child. The status widget shows
 
 ## Terminal backends
 
-When the parent Pi runs inside herdr (`HERDR_ENV=1`), subagents open as herdr panes; otherwise they use detached tmux sessions. Set `PI_SUBAGENT_BACKEND=tmux` or `PI_SUBAGENT_BACKEND=herdr` to force one.
+When the parent Pi runs inside herdr (`HERDR_ENV=1`), subagents open as herdr panes. Otherwise, inside a Rex terminal (`REX_SESSION` and `REX_BLOCK` set), they open as Rex blocks. Anywhere else they use detached tmux sessions. Set `PI_SUBAGENT_BACKEND` to `herdr`, `rex`, or `tmux` to force one.
 
 With herdr:
 
@@ -83,7 +83,14 @@ With herdr:
 - `--worktree <branch>` runs the child in a herdr-managed git worktree, opened as its own workspace grouped under the repository's workspace. An existing checkout of that branch is reused. `subagent stop` closes the workspace but keeps the checkout; remove it with `herdr worktree remove`.
 - Moved panes are followed by their Pi session file. If herdr restarts and resumes a child, the resumed process takes over the run, and a duplicate launched by the parent exits.
 
-To render children nested under their parent in the agents sidebar, add this to `~/.config/herdr/config.toml`:
+With Rex:
+
+- Children of one parent session share a `subagents` window (tab) in the parent's Rex session, split side by side without taking focus. The window closes when its last child stops.
+- Each child's block is labeled with its name, and `subagent rename` updates the label.
+- `/subagent` focuses the child's block; `subagent status` prints the matching `rex focus` command.
+- `--worktree` is not supported; it needs herdr.
+
+To render herdr children nested under their parent in the agents sidebar, add this to `~/.config/herdr/config.toml`:
 
 ```toml
 [ui.sidebar.agents]

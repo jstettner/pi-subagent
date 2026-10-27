@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 import { getPane, HERDR_METADATA_SOURCE, herdrAgentName, herdrBin, tryHerdr } from "./herdr.ts";
+import { rexBin, tryRex } from "./rex.ts";
 import {
 	effectiveRunState,
 	getRunsDir,
@@ -122,6 +123,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				if (!focused) ctx.ui.notify(`Could not focus ${run.handle}`, "error");
 				return;
 			}
+			if (runBackend(run) === "rex") {
+				const placement = run.rex;
+				const focused =
+					placement?.blockId !== undefined &&
+					tryRex(["focus", "-s", placement.sessionId, placement.blockId]) !== undefined;
+				if (!focused) ctx.ui.notify(`Could not focus ${run.handle}`, "error");
+				return;
+			}
 			const tmuxSession = run.tmuxSession;
 			if (!tmuxSession) return;
 
@@ -234,6 +243,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let herdrAgentLabel: string | undefined;
 	let herdrPending = false;
 	let yielded = false;
+	const rexBlockId = process.env.REX_BLOCK;
+	let rexLabel: string | undefined;
+	let rexPending = false;
 
 	const runHerdr = (args: string[]): Promise<boolean> =>
 		new Promise((resolveRun) => execFile(herdrBin(), args, (error) => resolveRun(!error)));
@@ -272,10 +284,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	/** Keep the rex block label in step with `subagent rename`. */
+	const syncRexLabel = (metadata: RunMetadata): void => {
+		const sessionId = metadata.rex?.sessionId;
+		if (runBackend(metadata) !== "rex" || !sessionId || !rexBlockId || rexPending) return;
+		const label = metadata.name ?? metadata.handle;
+		if (label === rexLabel) return;
+		rexPending = true;
+		execFile(rexBin(), ["block", "rename", "-s", sessionId, rexBlockId, label], (error) => {
+			rexPending = false;
+			if (!error) rexLabel = label;
+		});
+	};
+
 	const syncSessionName = (): void => {
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
 		void syncHerdrLabels(metadata);
+		syncRexLabel(metadata);
 		const next = `subagent ${metadata.name ?? metadata.handle}`;
 		if (next === sessionName) return;
 		pi.setSessionName(next);

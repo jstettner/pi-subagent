@@ -5,7 +5,7 @@ description: Spawn and communicate with observable Pi subagents. Use only when t
 
 # Subagent
 
-Use the `subagent` CLI to delegate work to a separate Pi process with its own context and terminal (a herdr pane when running inside herdr, otherwise a tmux session). Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
+Use the `subagent` CLI to delegate work to a separate Pi process with its own context and terminal (a herdr pane inside herdr, a Rex block inside Rex, otherwise a tmux session). Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
 
 ## Spawn
 
@@ -80,7 +80,7 @@ subagent send <handle> "message"
 subagent send <handle> --follow-up "message"
 ```
 
-Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`, `herdr agent prompt`, or `herdr pane send-text`.
+Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`, `herdr agent prompt`, `herdr pane send-text`, or `rex send`.
 
 ## Stop
 
@@ -88,6 +88,6 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates its tmux session or herdr pane and removes the run transcript and metadata. A `--worktree` checkout is kept. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates its tmux session, herdr pane, or Rex block and removes the run transcript and metadata. A `--worktree` checkout is kept. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Inside herdr, selecting one focuses its pane. With tmux, selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
+The interactive `/subagent` command lists active subagents spawned by the current Pi session. Inside herdr or Rex, selecting one focuses its pane. With tmux, selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
