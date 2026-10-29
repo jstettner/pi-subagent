@@ -1,8 +1,5 @@
 import { spawnSync } from "node:child_process";
 
-/** Label of the window that groups the subagents of one parent session. */
-export const REX_WINDOW_LABEL = "subagents";
-
 export interface RexProcess {
 	child?: { pid: number };
 	last_exit?: { exit_code: number; error?: string } | null;
@@ -51,13 +48,4 @@ export function blockProcess(sessionId: string, blockId: string): RexProcess | u
 export function blockIsRunning(sessionId: string, blockId: string): boolean {
 	const terminal = blockProcess(sessionId, blockId);
 	return terminal !== undefined && !terminal.last_exit;
-}
-
-/** Split right when the block is wide, down when it is tall (terminal cells are roughly twice as tall as wide). */
-export function splitDirection(sessionId: string, blockId: string): "right" | "below" {
-	const size = tryRex(["block", "call", "-s", sessionId, "-b", blockId, "size"]) as
-		| { columns?: number; rows?: number }
-		| undefined;
-	if (!size?.columns || !size.rows) return "right";
-	return size.columns >= size.rows * 2.5 ? "right" : "below";
 }

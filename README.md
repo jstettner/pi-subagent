@@ -85,7 +85,7 @@ With herdr:
 
 With Rex:
 
-- Children of one parent session share a `subagents` window (tab) in the parent's Rex session, split side by side without taking focus. The window closes when its last child stops.
+- The first child opens below the parent's pane without taking focus. Additional children split side by side within that lower area. Stopping the last child restores the parent's space; no separate tab is opened. The CLI requests 35% height for the lower area, though Rex versions that ignore `--ratio` use 50%.
 - Each child's block is labeled with its name, and `subagent rename` updates the label.
 - `/subagent` focuses the child's block; `subagent status` prints the matching `rex focus` command.
 - `--worktree` is not supported; it needs herdr.

@@ -22,7 +22,7 @@ import {
 	splitDirection,
 	tryHerdr,
 } from "./herdr.ts";
-import { blockIsRunning, insideRex, REX_WINDOW_LABEL, rex, splitDirection as rexSplitDirection, tryRex } from "./rex.ts";
+import { blockIsRunning, insideRex, rex, tryRex } from "./rex.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
@@ -42,6 +42,8 @@ export interface HerdrPlacement {
 export interface RexPlacement {
 	/** Rex session of the spawning parent; the child's block lives there. */
 	sessionId: string;
+	/** Parent block whose lower area hosts this run and its siblings. */
+	parentBlockId?: string;
 	blockId?: string;
 	windowId?: string;
 }
@@ -232,7 +234,7 @@ export function runIsAlive(metadata: RunMetadata): boolean {
 
 /**
  * Terminate the child process. Herdr closes the pane, and the tab or worktree workspace once it is empty;
- * rex closes the block, and its window once it is empty.
+ * Rex closes only the child's block, leaving the parent's pane and window intact.
  */
 export function killRun(metadata: RunMetadata): void {
 	if (runBackend(metadata) === "herdr") {
@@ -434,7 +436,7 @@ function rexBlockWindow(sessionId: string, blockId: string): string | undefined 
 }
 
 /**
- * Split a live sibling's block in the parent's subagents window, or open that window in the parent's rex session.
+ * Split below the parent for the first child, then split siblings to the right within that lower area.
  * Rex passes the command's arguments through unchanged and closes the block when pi exits, so block liveness
  * tracks the child process.
  */
@@ -442,6 +444,9 @@ function launchRexRun(metadata: RunMetadata, initialArgs: string[]): void {
 	const placement = metadata.rex;
 	if (!placement) throw new Error(`${metadata.handle} has no rex placement`);
 	const sessionId = placement.sessionId;
+	const parentBlockId = process.env.REX_BLOCK || placement.parentBlockId;
+	const windowId = parentBlockId ? rexBlockWindow(sessionId, parentBlockId) : undefined;
+	if (!parentBlockId || !windowId) throw new Error("The parent Rex block is no longer available");
 	const command = piCommand(metadata, initialArgs);
 	const label = metadata.name ?? metadata.handle;
 
@@ -452,54 +457,37 @@ function launchRexRun(metadata: RunMetadata, initialArgs: string[]): void {
 				run.parentSessionId !== undefined &&
 				runBackend(run) === "rex" &&
 				run.rex?.sessionId === sessionId &&
+				run.rex.parentBlockId === parentBlockId &&
 				run.rex.blockId !== undefined &&
-				run.rex.windowId !== undefined,
+				run.rex.windowId === windowId,
 		)
 		.reverse()
-		.find((run) => rexBlockWindow(sessionId, run.rex!.blockId!) === run.rex!.windowId);
+		.find((run) => rexBlockWindow(sessionId, run.rex!.blockId!) === windowId && runIsAlive(run));
 
-	let blockId: string;
-	let windowId: string;
-	if (sibling?.rex?.blockId && sibling.rex.windowId) {
-		const anchor = sibling.rex.blockId;
-		const split = rex([
-			"split",
-			"-s",
-			sessionId,
-			"-b",
-			anchor,
-			"--split",
-			rexSplitDirection(sessionId, anchor),
-			"-c",
-			metadata.cwd,
-			"--label",
-			label,
-			"--focus=false",
-			"--json",
-			"--",
-			...command,
-		]);
-		blockId = (split.block_ids as string[])[0];
-		windowId = sibling.rex.windowId;
-	} else {
-		const created = rex([
-			"window",
-			"new",
-			"-s",
-			sessionId,
-			REX_WINDOW_LABEL,
-			"-c",
-			metadata.cwd,
-			"--focus=false",
-			"--json",
-			"--",
-			...command,
-		]);
-		blockId = (created.block_ids as string[])[0];
-		windowId = created.window_id as string;
-		tryRex(["block", "rename", "-s", sessionId, blockId, label]);
-	}
-	updateMetadata(metadata.runDir, { rex: { ...readMetadata(metadata.runDir)?.rex, sessionId, blockId, windowId } });
+	const siblingBlockId = sibling?.rex?.blockId;
+	const split = rex([
+		"split",
+		"-s",
+		sessionId,
+		"-b",
+		siblingBlockId ?? parentBlockId,
+		"--split",
+		siblingBlockId ? "right" : "below",
+		"--ratio",
+		siblingBlockId ? "50" : "35",
+		"-c",
+		metadata.cwd,
+		"--label",
+		label,
+		"--focus=false",
+		"--json",
+		"--",
+		...command,
+	]);
+	const blockId = (split.block_ids as string[])[0];
+	updateMetadata(metadata.runDir, {
+		rex: { ...readMetadata(metadata.runDir)?.rex, sessionId, parentBlockId, blockId, windowId },
+	});
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
