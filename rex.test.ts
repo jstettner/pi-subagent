@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
+import { promisify } from "node:util";
 import { killRun, launchRun, readMetadata, writeMetadata, type RunMetadata } from "./shared.ts";
 
 let root: string;
@@ -35,7 +37,14 @@ if (args[0] === "block" && args[1] === "inspect") {
   if (!block) process.exit(1);
   emit(block.exited ? { last_exit: { exit_code: 0 } } : { child: { pid: 123 } });
 } else if (args[0] === "split") {
-  emit({ block_ids: ["new-child", args[args.indexOf("-b") + 1]] });
+  const delay = Number(process.env.REX_TEST_SPLIT_DELAY_MS ?? 0);
+  if (delay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+  const target = args[args.indexOf("-b") + 1];
+  const id = "child-" + args[args.indexOf("--label") + 1];
+  const current = JSON.parse(fs.readFileSync(path.join(root, "blocks.json"), "utf8"));
+  current[id] = { window_id: current[target].window_id };
+  fs.writeFileSync(path.join(root, "blocks.json"), JSON.stringify(current));
+  emit({ block_ids: [id, target] });
 } else if (args[0] !== "block" || args[1] !== "close") {
   process.exit(1);
 }
@@ -77,6 +86,15 @@ function launch(metadata: RunMetadata): string[] {
 	return calls().find(args => args[0] === "split")!;
 }
 
+/** Launch in a separate process, as concurrent `subagent spawn` commands do. */
+async function launchElsewhere(metadata: RunMetadata): Promise<void> {
+	const script = join(root, "launch.mjs");
+	writeFileSync(script, `import { launchRun, readMetadata } from ${JSON.stringify(new URL("./shared.ts", import.meta.url).href)};
+launchRun(readMetadata(process.argv[2]), ["Task: test"]);
+`);
+	await promisify(execFile)(process.execPath, [script, metadata.runDir]);
+}
+
 function calls(): string[][] {
 	return readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 }
@@ -96,8 +114,28 @@ test("first child opens below the parent at 35%, preserving focus and launch arg
 	assert.ok(args.includes("--focus=false"));
 	assert.equal(args.at(-1), "Task: test");
 	assert.deepEqual(readMetadata(metadata.runDir)?.rex, {
-		sessionId: "rex-session", parentBlockId: "parent", blockId: "new-child", windowId: "parent-window",
+		sessionId: "rex-session", parentBlockId: "parent", blockId: "child-Reviewer", windowId: "parent-window",
 	});
+});
+
+test("concurrent spawns open one child below the parent and split the other beside it", async () => {
+	process.env.REX_TEST_SPLIT_DELAY_MS = "300";
+	writeFileSync(join(root, "blocks.json"), JSON.stringify(blocks));
+	await Promise.all([launchElsewhere(run("one")), launchElsewhere(run("two"))]);
+	const [first, second] = calls().filter(args => args[0] === "split");
+	assert.equal(option(first, "-b"), "parent");
+	assert.equal(option(first, "--split"), "below");
+	assert.equal(option(second, "-b"), `child-${option(first, "--label")}`);
+	assert.equal(option(second, "--split"), "right");
+});
+
+test("a placement lock left by a dead process does not block spawning", () => {
+	const lock = join(root, "subagents", "placement.lock");
+	mkdirSync(join(root, "subagents"), { recursive: true });
+	writeFileSync(lock, String(2 ** 31 - 2));
+	const args = launch(run("first"));
+	assert.equal(option(args, "-b"), "parent");
+	assert.equal(existsSync(lock), false);
 });
 
 test("additional children split a live sibling to the right, never the parent", () => {
@@ -144,6 +182,6 @@ test("stopping a child closes only its block", () => {
 	const metadata = run("first");
 	launch(metadata);
 	killRun(readMetadata(metadata.runDir)!);
-	assert.deepEqual(calls().at(-1), ["block", "close", "-s", "rex-session", "new-child"]);
+	assert.deepEqual(calls().at(-1), ["block", "close", "-s", "rex-session", "child-first"]);
 	assert.ok(calls().every(args => args[0] !== "window"));
 });

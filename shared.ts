@@ -8,6 +8,7 @@ import {
 	readdirSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -190,6 +191,52 @@ export async function waitForRunShutdown(runDir: string, timeoutMs = 2000): Prom
 
 export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
+
+/** A placement lock older than this is abandoned, even if its holder's PID now belongs to another process. */
+const PLACEMENT_LOCK_STALE_MS = 30_000;
+
+function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function placementLockIsStale(lock: string): boolean {
+	try {
+		const holder = Number.parseInt(readFileSync(lock, "utf8"), 10);
+		return (holder > 0 && !processExists(holder)) || Date.now() - statSync(lock).mtimeMs > PLACEMENT_LOCK_STALE_MS;
+	} catch {
+		// Released between our attempt to take it and this check.
+		return false;
+	}
+}
+
+/**
+ * Serialize placement across concurrent spawns. Each spawn splits the newest live sibling it finds, and a sibling
+ * only becomes visible once its own placement has recorded its pane or block, so unserialized spawns all see none.
+ */
+function withPlacementLock<T>(place: () => T): T {
+	mkdirSync(getRunsDir(), { recursive: true, mode: 0o700 });
+	const lock = join(getRunsDir(), "placement.lock");
+	for (;;) {
+		try {
+			writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		if (placementLockIsStale(lock)) rmSync(lock, { force: true });
+		else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+	}
+	try {
+		return place();
+	} finally {
+		rmSync(lock, { force: true });
+	}
 }
 
 export function runBackend(metadata: RunMetadata): RunBackend {
@@ -401,9 +448,7 @@ function placeInSubagentsTab(metadata: RunMetadata): PaneResult {
 	return herdr(args).root_pane as PaneResult;
 }
 
-function launchHerdrRun(metadata: RunMetadata, initialArgs: string[]): void {
-	const worktree = metadata.herdr?.worktree;
-	const pane = worktree ? placeInWorktree(metadata, worktree) : placeInSubagentsTab(metadata);
+function recordHerdrPane(metadata: RunMetadata, pane: PaneResult): PaneResult {
 	updateMetadata(metadata.runDir, {
 		herdr: {
 			...readMetadata(metadata.runDir)?.herdr,
@@ -412,6 +457,14 @@ function launchHerdrRun(metadata: RunMetadata, initialArgs: string[]): void {
 			workspaceId: pane.workspace_id,
 		},
 	});
+	return pane;
+}
+
+function launchHerdrRun(metadata: RunMetadata, initialArgs: string[]): void {
+	const worktree = metadata.herdr?.worktree;
+	const pane = worktree
+		? recordHerdrPane(metadata, placeInWorktree(metadata, worktree))
+		: withPlacementLock(() => recordHerdrPane(metadata, placeInSubagentsTab(metadata)));
 	tryHerdr(["pane", "rename", pane.pane_id, metadata.name ?? metadata.handle]);
 
 	// The pane runs a shell; a script avoids quoting the prompt through it, and `exec` makes the pane close
@@ -449,7 +502,17 @@ function launchRexRun(metadata: RunMetadata, initialArgs: string[]): void {
 	if (!parentBlockId || !windowId) throw new Error("The parent Rex block is no longer available");
 	const command = piCommand(metadata, initialArgs);
 	const label = metadata.name ?? metadata.handle;
+	withPlacementLock(() => placeRexBlock(metadata, sessionId, parentBlockId, windowId, label, command));
+}
 
+function placeRexBlock(
+	metadata: RunMetadata,
+	sessionId: string,
+	parentBlockId: string,
+	windowId: string,
+	label: string,
+	command: string[],
+): void {
 	const sibling = listRuns(metadata.parentSessionId)
 		.filter(
 			(run) =>
