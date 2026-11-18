@@ -14,10 +14,10 @@
  * this extension rather than a standalone one because children keep this extension under
  * `--no-extensions`.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type ExtensionAPI, type ExtensionContext, isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "./shared.ts";
+import { getSerialDir, serialEnabled } from "./shared.ts";
 
 /** Providers whose server keeps a single cache slot; hosted providers cache every prefix and never wait. */
 const SERIAL_PROVIDERS = new Set(["ollama"]);
@@ -27,15 +27,13 @@ const POLL_MS = 500;
 const TOOL_RELEASE_MS = 20_000;
 const SUBAGENT_WAIT = /\bsubagent\s+wait\b/;
 
-const root = (): string => join(getAgentDir(), "serial-subagents");
+const root = getSerialDir;
 const flagFile = (): string => join(root(), "enabled");
 // One ticket per waiter or holder, `<priority><ms>-<pid>`, the time padded to 15 digits: parents `0`, subagents `1`,
 // so a name sort is the line. The pid stays the second field, as in tickets without a priority digit (`<ms>-<pid>`),
 // which sort between the two.
 const queueDir = (): string => join(root(), "queue");
 const heldDir = (): string => join(root(), "held"); // mkdir is the atomic lock; `pid` inside names the holder
-
-export const serialEnabled = (): boolean => existsSync(flagFile());
 
 const alive = (pid: number): boolean => {
 	try {

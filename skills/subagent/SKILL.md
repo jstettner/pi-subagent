@@ -65,7 +65,7 @@ subagent wait <handle>
 
 Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
 
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline. In serial mode (`/serial`) `wait` has no default deadline, since a child may queue behind every other agent's whole task: give the bash call a generous timeout, or none.
 
 ## Communicate
 

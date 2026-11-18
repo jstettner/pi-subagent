@@ -27,6 +27,7 @@ import {
 	updateMetadata,
 	waitForRunShutdown,
 	writeMetadata,
+	serialEnabled,
 } from "./shared.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -274,8 +275,9 @@ function sendSubagent(args: string[]): void {
 	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
 }
 
-function parseTimeout(args: string[]): number {
-	if (args.length === 0) return 1800;
+/** An explicit `--timeout`, or undefined for the default. */
+function parseTimeout(args: string[]): number | undefined {
+	if (args.length === 0) return undefined;
 	if (args.length !== 2 || args[0] !== "--timeout") usage();
 	const timeout = Number(args[1]);
 	if (!Number.isInteger(timeout) || timeout <= 0) fail("--timeout must be a positive integer");
@@ -285,7 +287,9 @@ function parseTimeout(args: string[]): number {
 async function waitSubagent(args: string[]): Promise<void> {
 	const handle = args.shift();
 	if (!handle) usage();
-	const timeoutSeconds = parseTimeout(args);
+	// In serial mode a child may wait in line behind every other agent's whole task, so only an explicit
+	// `--timeout` bounds the wait.
+	const timeoutSeconds = parseTimeout(args) ?? (serialEnabled() ? Infinity : 1800);
 	const deadline = Date.now() + timeoutSeconds * 1000;
 
 	while (Date.now() < deadline) {

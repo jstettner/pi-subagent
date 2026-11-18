@@ -119,4 +119,4 @@ A local server with one cache slot, such as Ollama with `OLLAMA_NUM_PARALLEL=1`,
 - A subagent holds the lock until its run settles, then the next in line, in arrival order, takes it.
 - A parent goes ahead of every waiting subagent, behind only the current holder, so its own work keeps a warm cache. It lets go when its run settles or when it blocks on a tool (a `subagent wait`, or any tool still running after 20 seconds), so its children run while it waits on them.
 
-The setting is a file (`~/.pi/agent/serial-subagents/enabled`), so running sessions pick it up too, and it survives restarts. Children keep it under `--no-extensions`.
+The setting is a file (`~/.pi/agent/serial-subagents/enabled`), so running sessions pick it up too, and it survives restarts. Children keep it under `--no-extensions`. While it's on, `subagent wait` has no default deadline, since a child may wait in line behind every other agent's whole task; an explicit `--timeout` still applies.

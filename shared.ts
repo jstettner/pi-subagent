@@ -106,6 +106,15 @@ export function getAgentDir(): string {
 	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
+/** Serial mode's lock and flag (see serial.ts); here so the CLI can read the flag without loading Pi. */
+export function getSerialDir(): string {
+	return join(getAgentDir(), "serial-subagents");
+}
+
+export function serialEnabled(): boolean {
+	return existsSync(join(getSerialDir(), "enabled"));
+}
+
 export function getRunsDir(): string {
 	return join(getAgentDir(), "subagents");
 }
