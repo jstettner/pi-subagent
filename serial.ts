@@ -11,6 +11,9 @@
  *   It lets go when it settles or blocks on a tool (a `subagent wait`, or any tool still running after
  *   TOOL_RELEASE_MS), so its children can run while it waits on them.
  *
+ * While a session waits in line it reports a `serial` record of `blocked` to the terminal (OSC 7501, the
+ * Program Status Protocol), beside the root record Pi itself keeps, and clears it once it holds a lock.
+ *
  * `/serial` toggles it from any Pi. The flag is a file, so running sessions see it at once. It lives in
  * this extension rather than a standalone one because children keep this extension under
  * `--no-extensions`.
@@ -45,6 +48,13 @@ const queueDir = (provider: string): string => join(root(), provider === "ollama
 /** mkdir is the atomic lock; `pid` inside names the holder. */
 const heldDir = (provider: string, slot: number): string =>
 	join(root(), provider === "ollama" && slot === 0 ? "held" : `held-${provider}-${slot}`);
+
+/** The record this extension owns beside Pi's root record; Pi rewrites the root on its own events. */
+const RECORD_ID = "serial";
+
+const writeRecord = (pairs: string): void => {
+	if (process.stdout.isTTY) process.stdout.write(`\x1b]7501;${pairs}\x1b\\`);
+};
 
 const alive = (pid: number): boolean => {
 	try {
@@ -110,6 +120,18 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 	let ticket: string | undefined;
 	let ticketDir: string | undefined;
 	let held: string | undefined; // the lock directory this session holds
+	let reported: string | undefined; // the waiting message last reported to the terminal
+
+	const reportWaiting = (message: string): void => {
+		if (message === reported) return;
+		reported = message;
+		writeRecord(`state=blocked:id=${RECORD_ID}:msg=${Buffer.from(message).toString("base64")}`);
+	};
+	const clearWaiting = (): void => {
+		if (reported === undefined) return;
+		reported = undefined;
+		writeRecord(`state=clear:id=${RECORD_ID}`);
+	};
 	let lastCtx: ExtensionContext | undefined;
 	const toolTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -125,6 +147,7 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 		held = undefined;
 		ticket = undefined;
 		ticketDir = undefined;
+		clearWaiting();
 		try {
 			lastCtx?.ui.setStatus(STATUS_KEY, undefined);
 		} catch {} // ctx goes stale once the session shuts down
@@ -144,11 +167,13 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 			const taken = position >= 0 && position < slots ? tryTakeSlot(provider, slots) : undefined;
 			if (taken) {
 				held = taken;
+				clearWaiting();
 				ctx.ui.setStatus(STATUS_KEY, theme.fg("success", "serial: running"));
 				return;
 			}
 			const ahead = Math.max(position - slots + 1, 1);
 			ctx.ui.setStatus(STATUS_KEY, theme.fg("warning", `serial: waiting (#${ahead} in queue)`));
+			reportWaiting(`Waiting for a slot on ${provider} (#${ahead} in line)`);
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, POLL_MS));
 		}
 		release(); // turned off or aborted while waiting
