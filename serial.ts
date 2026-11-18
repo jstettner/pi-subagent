@@ -29,7 +29,9 @@ const SUBAGENT_WAIT = /\bsubagent\s+wait\b/;
 
 const root = (): string => join(getAgentDir(), "serial-subagents");
 const flagFile = (): string => join(root(), "enabled");
-// One ticket per waiter or holder, `<priority>-<ms>-<pid>`: parents `0`, subagents `1`, so a name sort is the line.
+// One ticket per waiter or holder, `<priority><ms>-<pid>`, the time padded to 15 digits: parents `0`, subagents `1`,
+// so a name sort is the line. The pid stays the second field, as in tickets without a priority digit (`<ms>-<pid>`),
+// which sort between the two.
 const queueDir = (): string => join(root(), "queue");
 const heldDir = (): string => join(root(), "held"); // mkdir is the atomic lock; `pid` inside names the holder
 
@@ -49,7 +51,7 @@ function liveTickets(): string[] {
 	return readdirSync(queueDir())
 		.sort()
 		.filter((name) => {
-			if (alive(Number(name.split("-").at(-1)))) return true;
+			if (alive(Number(name.split("-")[1]))) return true;
 			rmSync(join(queueDir(), name), { force: true });
 			return false;
 		});
@@ -107,11 +109,12 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 
 	const acquire = async (ctx: ExtensionContext): Promise<void> => {
 		mkdirSync(queueDir(), { recursive: true });
-		ticket ??= `${priority}-${String(Date.now()).padStart(15, "0")}-${process.pid}`;
-		writeFileSync(join(queueDir(), ticket), "");
+		ticket ??= `${priority}${String(Date.now()).padStart(15, "0")}-${process.pid}`;
 		const { theme } = ctx.ui;
 		while (!ctx.signal?.aborted) {
 			if (!serialEnabled()) break;
+			// (Re)write the ticket each time: another process may have pruned it.
+			writeFileSync(join(queueDir(), ticket), "");
 			const position = liveTickets().indexOf(ticket);
 			if (position === 0 && tryTakeHeld()) {
 				held = true;
