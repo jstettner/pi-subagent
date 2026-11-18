@@ -102,7 +102,9 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 		if (ticket) rmSync(join(queueDir(), ticket), { force: true });
 		held = false;
 		ticket = undefined;
-		lastCtx?.ui.setStatus(STATUS_KEY, undefined);
+		try {
+			lastCtx?.ui.setStatus(STATUS_KEY, undefined);
+		} catch {} // ctx goes stale once the session shuts down
 	};
 
 	const acquire = async (ctx: ExtensionContext): Promise<void> => {
@@ -136,7 +138,10 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 	pi.on("agent_settled", () => release());
 	// A dialog waiting on a person shouldn't stall the other agents.
 	pi.on("ui_prompt_start", () => release());
-	pi.on("session_shutdown", () => release());
+	pi.on("session_shutdown", () => {
+		release();
+		lastCtx = undefined;
+	});
 	process.once("exit", () => release());
 
 	if (isChild) return;
