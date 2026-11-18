@@ -114,6 +114,9 @@ Nested subagents are disabled. Child sessions do not receive the subagent skill.
 
 ## Serial mode
 
-A local server with one cache slot, such as Ollama with `OLLAMA_NUM_PARALLEL=1`, keeps only one conversation's prefix warm. Subagents that interleave their model calls evict each other and re-prefill their whole context on every call. `/serial` toggles serial mode: subagents on the `ollama` provider then take turns running whole tasks, each taking a machine-wide first-come, first-served lock before its first model call and holding it until its run settles. Their footer shows `serial: waiting (#N in queue)` or `serial: running`.
+A local server with one cache slot, such as Ollama with `OLLAMA_NUM_PARALLEL=1`, keeps only one conversation's prefix warm. Agents that interleave their model calls evict each other and re-prefill their whole context on every call. `/serial` toggles serial mode: Pi sessions on the `ollama` provider then take turns on the model, through a machine-wide lock each takes before its first model call. The footer shows `serial: waiting (#N in queue)` or `serial: running`.
 
-The setting is a file (`~/.pi/agent/serial-subagents/enabled`), so running subagents pick it up too, and it survives restarts. Children keep it under `--no-extensions`. The parent never waits, so wait for all children in one turn (parallel `subagent wait` calls) to wake it once.
+- A subagent holds the lock until its run settles, then the next in line, in arrival order, takes it.
+- A parent goes ahead of every waiting subagent, behind only the current holder, so its own work keeps a warm cache. It lets go when its run settles or when it blocks on a tool (a `subagent wait`, or any tool still running after 20 seconds), so its children run while it waits on them.
+
+The setting is a file (`~/.pi/agent/serial-subagents/enabled`), so running sessions pick it up too, and it survives restarts. Children keep it under `--no-extensions`.
