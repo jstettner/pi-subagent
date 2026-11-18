@@ -111,3 +111,9 @@ Optional spawn flags:
 - `--no-context-files`: ignore repository instruction files
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+
+## Serial mode
+
+A local server with one cache slot, such as Ollama with `OLLAMA_NUM_PARALLEL=1`, keeps only one conversation's prefix warm. Subagents that interleave their model calls evict each other and re-prefill their whole context on every call. `/serial` toggles serial mode: subagents on the `ollama` provider then take turns running whole tasks, each taking a machine-wide first-come, first-served lock before its first model call and holding it until its run settles. Their footer shows `serial: waiting (#N in queue)` or `serial: running`.
+
+The setting is a file (`~/.pi/agent/serial-subagents/enabled`), so running subagents pick it up too, and it survives restarts. Children keep it under `--no-extensions`. The parent never waits, so wait for all children in one turn (parallel `subagent wait` calls) to wake it once.
