@@ -105,16 +105,12 @@ rows = [
 Optional spawn flags:
 
 - `--tools <names>`: comma-separated tool allowlist
-- `--no-extensions`: disable extension discovery while retaining the control bridge
+- `--no-extensions`: disable extension discovery while retaining the control bridge, plus any extensions listed in `~/.pi/agent/subagent-extensions` (one path per line; `~` is the home directory, relative paths start from `~/.pi/agent`, and `#` starts a comment). Use it for guards every agent should keep.
 - `--no-skills`: disable skills
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
-
-## Disk-scan guard
-
-Agents looking for a file or package often search the whole disk (`find / -name …`, `rg pattern ~`), which runs for hours and, in serial mode, holds a lock the whole time. Every session that loads this extension, children included, has such `bash` commands blocked: `find`, `fd`, `rg`, `ag`, `du` and `tree` given `/`, the home directory or another top-level directory such as `/Users` or `/Library`, and `grep -r` or `ls -R` given one. `find` with `-maxdepth` 2 or less is allowed. The block tells the agent to search the working directory or a known path, or to ask Node where a package resolves.
 
 ## Serial mode
 

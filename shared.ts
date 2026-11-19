@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	findPaneBySession,
 	getPane,
@@ -113,6 +113,22 @@ export function getSerialDir(): string {
 
 export function serialEnabled(): boolean {
 	return existsSync(join(getSerialDir(), "enabled"));
+}
+
+/**
+ * Extensions children load besides this one, since `--no-extensions` drops every other: one path per line in
+ * `~/.pi/agent/subagent-extensions`, `~` for the home directory and relative paths from the agent directory.
+ * Blank lines and lines starting with `#` are ignored, and so are paths that don't exist.
+ */
+export function childExtensionPaths(): string[] {
+	const listFile = join(getAgentDir(), "subagent-extensions");
+	if (!existsSync(listFile)) return [];
+	return readFileSync(listFile, "utf8")
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line !== "" && !line.startsWith("#"))
+		.map((line) => (line === "~" || line.startsWith("~/") ? join(homedir(), line.slice(1)) : resolve(getAgentDir(), line)))
+		.filter((path) => existsSync(path));
 }
 
 export function getRunsDir(): string {

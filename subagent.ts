@@ -9,6 +9,7 @@ import { insideRex } from "./rex.ts";
 import {
 	assistantText,
 	attachHint,
+	childExtensionPaths,
 	effectiveRunState,
 	getRunsDir,
 	inboxDir,
@@ -177,7 +178,10 @@ function spawnSubagent(args: string[]): void {
 
 	const launchArgs: string[] = [];
 	if (tools) launchArgs.push("--tools", tools);
-	if (noExtensions) launchArgs.push("--no-extensions", "--extension", extensionPath);
+	if (noExtensions) {
+		launchArgs.push("--no-extensions", "--extension", extensionPath);
+		for (const path of childExtensionPaths()) launchArgs.push("--extension", path);
+	}
 	if (noSkills) launchArgs.push("--no-skills");
 	if (noPromptTemplates) launchArgs.push("--no-prompt-templates");
 	if (noContextFiles) launchArgs.push("--no-context-files");
