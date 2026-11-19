@@ -24,13 +24,18 @@ import { type ExtensionAPI, type ExtensionContext, isToolCallEventType } from "@
 import { getSerialDir, serialEnabled } from "./shared.ts";
 
 /**
- * Local providers and how many sessions may hold one of their locks at once; hosted providers cache every prefix and
- * never wait. `llama-local` is llama-server with `-np 8`: seven locks leave a slot that a parent waiting on its
- * children keeps warm.
+ * A local provider's locks: `slots` in all, as many as its server has KV cache slots, of which `reserved` only parents
+ * take, so a parent never waits for one of its children's whole tasks to end. Hosted providers cache every prefix and
+ * never wait.
  */
-const LANES: ReadonlyMap<string, number> = new Map([
-	["ollama", 1],
-	["llama-local", 7],
+interface Lane {
+	readonly slots: number;
+	readonly reserved: number;
+}
+
+const LANES: ReadonlyMap<string, Lane> = new Map([
+	["ollama", { slots: 1, reserved: 0 }],
+	["llama-local", { slots: 8, reserved: 1 }], // llama-server -np 8
 ]);
 const STATUS_KEY = "serial";
 const POLL_MS = 500;
@@ -95,9 +100,9 @@ function tryTakeHeld(dir: string): boolean {
 	}
 }
 
-/** Takes the first free lock of the provider's lane, returning its directory. */
-function tryTakeSlot(provider: string, slots: number): string | undefined {
-	for (let slot = 0; slot < slots; slot++) {
+/** Takes the first free lock numbered `from` to `to` (exclusive), returning its directory. */
+function tryTakeSlot(provider: string, from: number, to: number): string | undefined {
+	for (let slot = from; slot < to; slot++) {
 		const dir = heldDir(provider, slot);
 		if (tryTakeHeld(dir)) return dir;
 	}
@@ -153,25 +158,36 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 		} catch {} // ctx goes stale once the session shuts down
 	};
 
-	const acquire = async (ctx: ExtensionContext, provider: string, slots: number): Promise<void> => {
+	const acquire = async (ctx: ExtensionContext, provider: string, lane: Lane): Promise<void> => {
+		const shared = lane.slots - lane.reserved;
+		const { theme } = ctx.ui;
+		const running = (lock: string): void => {
+			held = lock;
+			clearWaiting();
+			ctx.ui.setStatus(STATUS_KEY, theme.fg("success", "serial: running"));
+		};
+		// A parent takes a reserved lock without joining the line, so it never pushes a child back in it.
+		const reserved = isChild ? undefined : tryTakeSlot(provider, shared, lane.slots);
+		if (reserved) return running(reserved);
+
 		ticketDir = queueDir(provider);
 		mkdirSync(ticketDir, { recursive: true });
 		ticket ??= `${priority}${String(Date.now()).padStart(15, "0")}-${process.pid}`;
-		const { theme } = ctx.ui;
 		while (!ctx.signal?.aborted) {
 			if (!serialEnabled()) break;
 			// (Re)write the ticket each time: another process may have pruned it.
 			writeFileSync(join(ticketDir, ticket), "");
-			// Holders keep their tickets, so fewer than `slots` tickets ahead means a lock is free or about to be.
+			// Holders of shared locks keep their tickets, so fewer than `shared` tickets ahead means one is free or about to be.
 			const position = liveTickets(provider).indexOf(ticket);
-			const taken = position >= 0 && position < slots ? tryTakeSlot(provider, slots) : undefined;
-			if (taken) {
-				held = taken;
-				clearWaiting();
-				ctx.ui.setStatus(STATUS_KEY, theme.fg("success", "serial: running"));
-				return;
+			const taken = position >= 0 && position < shared ? tryTakeSlot(provider, 0, shared) : undefined;
+			if (taken) return running(taken);
+			const freed = isChild ? undefined : tryTakeSlot(provider, shared, lane.slots);
+			if (freed) {
+				rmSync(join(ticketDir, ticket), { force: true }); // out of the line, as if it had taken it at once
+				ticket = undefined;
+				return running(freed);
 			}
-			const ahead = Math.max(position - slots + 1, 1);
+			const ahead = Math.max(position - shared + 1, 1);
 			ctx.ui.setStatus(STATUS_KEY, theme.fg("warning", `serial: waiting (#${ahead} in queue)`));
 			reportWaiting(`Waiting for a slot on ${provider} (#${ahead} in line)`);
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, POLL_MS));
@@ -183,9 +199,9 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 	pi.on("context", async (_event, ctx) => {
 		lastCtx = ctx;
 		if (held || !serialEnabled() || !ctx.model) return;
-		const slots = LANES.get(ctx.model.provider);
-		if (slots === undefined) return;
-		await acquire(ctx, ctx.model.provider, slots);
+		const lane = LANES.get(ctx.model.provider);
+		if (lane === undefined) return;
+		await acquire(ctx, ctx.model.provider, lane);
 	});
 
 	// Hold through retries, compactions and queued follow-ups; let go once the run is over.
