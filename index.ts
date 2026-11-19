@@ -6,6 +6,7 @@ import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from
 import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
 import { getPane, HERDR_METADATA_SOURCE, herdrAgentName, herdrBin, tryHerdr } from "./herdr.ts";
 import { rexBin, tryRex } from "./rex.ts";
+import { registerDiskScanGuard } from "./disk-scan.ts";
 import { registerSerial } from "./serial.ts";
 import {
 	effectiveRunState,
@@ -56,6 +57,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	// Keep nested spawns disabled for tools run by a child that herdr resumed without the environment.
 	if (runDir) process.env.PI_SUBAGENT_RUN_DIR = runDir;
 	registerSerial(pi, !!runDir);
+	registerDiskScanGuard(pi);
 	if (!runDir) {
 		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
 	}

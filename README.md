@@ -112,6 +112,10 @@ Optional spawn flags:
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
 
+## Disk-scan guard
+
+Agents looking for a file or package often search the whole disk (`find / -name …`, `rg pattern ~`), which runs for hours and, in serial mode, holds a lock the whole time. Every session that loads this extension, children included, has such `bash` commands blocked: `find`, `fd`, `rg`, `ag`, `du` and `tree` given `/`, the home directory or another top-level directory such as `/Users` or `/Library`, and `grep -r` or `ls -R` given one. `find` with `-maxdepth` 2 or less is allowed. The block tells the agent to search the working directory or a known path, or to ask Node where a package resolves.
+
 ## Serial mode
 
 A local server with one cache slot, such as Ollama with `OLLAMA_NUM_PARALLEL=1`, keeps only one conversation's prefix warm. Agents that interleave their model calls evict each other and re-prefill their whole context on every call. llama-server with `-np N` keeps N, and more agents than slots thrash the same way. `/serial` toggles serial mode: Pi sessions on a local provider then take turns on the model, through one of that provider's machine-wide locks, which each takes before its first model call. `ollama` has one lock. `llama-local` (llama-server `-np 8`) has eight, one of them reserved for parents: subagents share seven, and a parent takes the eighth without waiting in line, so it never waits for a child's whole task to end. Each provider has its own line (`LANES` in `serial.ts`). The footer shows `serial: waiting (#N in queue)` or `serial: running`. While a session waits, it also reports a `serial` record of `blocked` to the terminal (OSC 7501), so Rex shows it as held; the record clears once it takes a lock.
