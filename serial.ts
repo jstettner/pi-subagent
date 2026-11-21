@@ -4,7 +4,8 @@
  * OLLAMA_NUM_PARALLEL=1 keeps one slot, and llama-server `-np N` keeps N, so more agents than slots
  * evict each other and re-prefill their whole context on every call. Here each session takes one of
  * its provider's machine-wide locks before its first model call and keeps it while it works, so each
- * follow-up call only prefills what's new. Each provider has its own line and locks (`LANES`).
+ * follow-up call only prefills what's new. Each provider has its own line and locks (`LANES`), and so does a
+ * model listed there by itself: Ollama's MLX engine gives each model its own runner and slots.
  *
  * - A subagent holds the lock until its run settles, then the next in line takes it.
  * - A parent goes ahead of every waiting subagent: it waits only for the current holder to settle.
@@ -33,10 +34,21 @@ interface Lane {
 	readonly reserved: number;
 }
 
+/** Keyed by provider, or by `provider/model` (Ollama's `:tag` dropped) for a model with slots of its own. */
 const LANES: ReadonlyMap<string, Lane> = new Map([
 	["ollama", { slots: 1, reserved: 0 }],
+	["ollama/inkling-2-mini", { slots: 8, reserved: 1 }], // OLLAMA_NUM_PARALLEL=8, MLX runner
 	["llama-local", { slots: 8, reserved: 1 }], // llama-server -np 8
 ]);
+
+/** The lane a model call waits in, and its id: the model's own lane if it has one, else its provider's. */
+function laneFor(provider: string, model: string): [string, Lane] | undefined {
+	const own = `${provider}/${model.split(":")[0]}`;
+	const lane = LANES.get(own);
+	if (lane) return [own, lane];
+	const shared = LANES.get(provider);
+	return shared && [provider, shared];
+}
 const STATUS_KEY = "serial";
 const POLL_MS = 500;
 /** A parent's tool that runs this long is treated as waiting on something, and the parent lets go. */
@@ -49,10 +61,12 @@ const flagFile = (): string => join(root(), "enabled");
 // so a name sort is the line. The pid stays the second field, as in tickets without a priority digit (`<ms>-<pid>`),
 // which sort between the two.
 // Ollama's lane keeps the original names (`queue`, `held`), so sessions started before lanes still share its line.
-const queueDir = (provider: string): string => join(root(), provider === "ollama" ? "queue" : `queue-${provider}`);
+// A lane id becomes part of a file name, so `ollama/inkling-2-mini` becomes `ollama_inkling-2-mini`.
+const fileId = (lane: string): string => lane.replace(/[^\w.-]/g, "_");
+const queueDir = (lane: string): string => join(root(), lane === "ollama" ? "queue" : `queue-${fileId(lane)}`);
 /** mkdir is the atomic lock; `pid` inside names the holder. */
-const heldDir = (provider: string, slot: number): string =>
-	join(root(), provider === "ollama" && slot === 0 ? "held" : `held-${provider}-${slot}`);
+const heldDir = (lane: string, slot: number): string =>
+	join(root(), lane === "ollama" && slot === 0 ? "held" : `held-${fileId(lane)}-${slot}`);
 
 /** The record this extension owns beside Pi's root record; Pi rewrites the root on its own events. */
 const RECORD_ID = "serial";
@@ -71,8 +85,8 @@ const alive = (pid: number): boolean => {
 };
 
 /** Live tickets in line order, removing those of processes that died. */
-function liveTickets(provider: string): string[] {
-	const dir = queueDir(provider);
+function liveTickets(laneId: string): string[] {
+	const dir = queueDir(laneId);
 	return readdirSync(dir)
 		.sort()
 		.filter((name) => {
@@ -101,15 +115,15 @@ function tryTakeHeld(dir: string): boolean {
 }
 
 /** Takes the first free lock numbered `from` to `to` (exclusive), returning its directory. */
-function tryTakeSlot(provider: string, from: number, to: number): string | undefined {
+function tryTakeSlot(laneId: string, from: number, to: number): string | undefined {
 	for (let slot = from; slot < to; slot++) {
-		const dir = heldDir(provider, slot);
+		const dir = heldDir(laneId, slot);
 		if (tryTakeHeld(dir)) return dir;
 	}
 	return undefined;
 }
 
-/** Registers `/serial` everywhere, and the lock in every session that calls a serial provider. */
+/** Registers `/serial` everywhere, and the lock in every session that calls a serial provider or model. */
 export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 	pi.registerCommand("serial", {
 		description: "Toggle running local-model agents one at a time, keeping the KV cache warm",
@@ -158,7 +172,7 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 		} catch {} // ctx goes stale once the session shuts down
 	};
 
-	const acquire = async (ctx: ExtensionContext, provider: string, lane: Lane): Promise<void> => {
+	const acquire = async (ctx: ExtensionContext, laneId: string, lane: Lane): Promise<void> => {
 		const shared = lane.slots - lane.reserved;
 		const { theme } = ctx.ui;
 		const running = (lock: string): void => {
@@ -167,10 +181,10 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 			ctx.ui.setStatus(STATUS_KEY, theme.fg("success", "serial: running"));
 		};
 		// A parent takes a reserved lock without joining the line, so it never pushes a child back in it.
-		const reserved = isChild ? undefined : tryTakeSlot(provider, shared, lane.slots);
+		const reserved = isChild ? undefined : tryTakeSlot(laneId, shared, lane.slots);
 		if (reserved) return running(reserved);
 
-		ticketDir = queueDir(provider);
+		ticketDir = queueDir(laneId);
 		mkdirSync(ticketDir, { recursive: true });
 		ticket ??= `${priority}${String(Date.now()).padStart(15, "0")}-${process.pid}`;
 		while (!ctx.signal?.aborted) {
@@ -178,10 +192,10 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 			// (Re)write the ticket each time: another process may have pruned it.
 			writeFileSync(join(ticketDir, ticket), "");
 			// Holders of shared locks keep their tickets, so fewer than `shared` tickets ahead means one is free or about to be.
-			const position = liveTickets(provider).indexOf(ticket);
-			const taken = position >= 0 && position < shared ? tryTakeSlot(provider, 0, shared) : undefined;
+			const position = liveTickets(laneId).indexOf(ticket);
+			const taken = position >= 0 && position < shared ? tryTakeSlot(laneId, 0, shared) : undefined;
 			if (taken) return running(taken);
-			const freed = isChild ? undefined : tryTakeSlot(provider, shared, lane.slots);
+			const freed = isChild ? undefined : tryTakeSlot(laneId, shared, lane.slots);
 			if (freed) {
 				rmSync(join(ticketDir, ticket), { force: true }); // out of the line, as if it had taken it at once
 				ticket = undefined;
@@ -189,7 +203,7 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 			}
 			const ahead = Math.max(position - shared + 1, 1);
 			ctx.ui.setStatus(STATUS_KEY, theme.fg("warning", `serial: waiting (#${ahead} in queue)`));
-			reportWaiting(`Waiting for a slot on ${provider} (#${ahead} in line)`);
+			reportWaiting(`Waiting for a slot on ${laneId} (#${ahead} in line)`);
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, POLL_MS));
 		}
 		release(); // turned off or aborted while waiting
@@ -199,9 +213,9 @@ export function registerSerial(pi: ExtensionAPI, isChild: boolean): void {
 	pi.on("context", async (_event, ctx) => {
 		lastCtx = ctx;
 		if (held || !serialEnabled() || !ctx.model) return;
-		const lane = LANES.get(ctx.model.provider);
-		if (lane === undefined) return;
-		await acquire(ctx, ctx.model.provider, lane);
+		const found = laneFor(ctx.model.provider, ctx.model.id);
+		if (found === undefined) return;
+		await acquire(ctx, ...found);
 	});
 
 	// Hold through retries, compactions and queued follow-ups; let go once the run is over.
