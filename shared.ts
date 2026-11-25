@@ -391,6 +391,7 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		],
 		{ encoding: "utf8" },
 	);
+	if (result.error) throw new Error(`Failed to run tmux: ${result.error.message}`);
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
 

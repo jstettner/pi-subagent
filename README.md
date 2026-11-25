@@ -72,7 +72,7 @@ Use `/subagent` to select and attach to an active child. The status widget shows
 
 ## Terminal backends
 
-When the parent Pi runs inside herdr (`HERDR_ENV=1`), subagents open as herdr panes. Otherwise, inside a Rex terminal (`REX_SESSION` and `REX_BLOCK` set), they open as Rex blocks. Anywhere else they use detached tmux sessions. Set `PI_SUBAGENT_BACKEND` to `herdr`, `rex`, or `tmux` to force one.
+When the parent Pi runs inside herdr (`HERDR_ENV=1`), subagents open as herdr panes. Otherwise, inside a Rex terminal (`REX_BLOCK` set; the session is `REX_SESSION` when set, otherwise the one `rex whoami` names), they open as Rex blocks. Anywhere else they use detached tmux sessions. Set `PI_SUBAGENT_BACKEND` to `herdr`, `rex`, or `tmux` to force one.
 
 With herdr:
 

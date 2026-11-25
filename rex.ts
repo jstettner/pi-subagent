@@ -10,7 +10,15 @@ export function rexBin(): string {
 }
 
 export function insideRex(): boolean {
-	return !!process.env.REX_SESSION && !!process.env.REX_BLOCK;
+	return !!process.env.REX_BLOCK;
+}
+
+/** The Rex session holding this terminal: `REX_SESSION` when set, otherwise the one Rex resolves for `REX_BLOCK`. */
+export function currentRexSession(): string {
+	if (process.env.REX_SESSION) return process.env.REX_SESSION;
+	const sessionId = rex(["whoami", "--json"]).session_id;
+	if (typeof sessionId !== "string") throw new Error("rex whoami named no session for this terminal");
+	return sessionId;
 }
 
 /** Run a rex CLI command and return its JSON output, if any. Throws with rex's error message on failure. */

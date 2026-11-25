@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "n
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { insideHerdr } from "./herdr.ts";
-import { insideRex } from "./rex.ts";
+import { currentRexSession, insideRex } from "./rex.ts";
 import {
 	assistantText,
 	attachHint,
@@ -202,7 +202,7 @@ function spawnSubagent(args: string[]): void {
 						worktree: worktreeBranch ? { branch: worktreeBranch, repoCwd: cwd } : undefined,
 					}
 				: undefined,
-		rex: backend === "rex" ? { sessionId: process.env.REX_SESSION! } : undefined,
+		rex: backend === "rex" ? { sessionId: currentRexSession() } : undefined,
 		runDir,
 		sessionFile,
 		cwd,
